@@ -1,11 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# 
-──────────────────────────────────────────────────────────────────────────────
-# Utility functions
-# 
-──────────────────────────────────────────────────────────────────────────────
+
 is_installed() {
   dpkg -s "$1" &>/dev/null
 }
@@ -38,10 +34,10 @@ reinstall_mysql() {
 }
 
 # 
-──────────────────────────────────────────────────────────────────────────────
+
 # 1) Update & prerequisites
 # 
-──────────────────────────────────────────────────────────────────────────────
+
 echo "→ Updating apt…"
 sudo apt update
 echo "→ Upgrading packages…"
@@ -53,25 +49,25 @@ for pkg in "${PREREQS[@]}"; do
 done
 
 # 
-──────────────────────────────────────────────────────────────────────────────
+
 # 2) Add PHP PPA
 # 
-──────────────────────────────────────────────────────────────────────────────
+
 add_php_ppa
 
 # 
-──────────────────────────────────────────────────────────────────────────────
+
 # 3) Install Nginx
 # 
-──────────────────────────────────────────────────────────────────────────────
+
 install_pkg nginx
 sudo systemctl enable --now nginx
 
 # 
-──────────────────────────────────────────────────────────────────────────────
+
 # 4) Install & configure MySQL root
 # 
-──────────────────────────────────────────────────────────────────────────────
+
 if is_installed mysql-server; then
   echo "→ MySQL already installed, skipping install."
 else
@@ -104,10 +100,10 @@ EOF
 fi
 
 # 
-──────────────────────────────────────────────────────────────────────────────
+
 # 5) Install PHP 8.1–8.4 & Laravel extensions
 # 
-──────────────────────────────────────────────────────────────────────────────
+
 PHP_VERSIONS=(8.1 8.2 8.3 8.4)
 EXTS=(fpm cli mysql mbstring curl xml zip gd opcache bcmath intl tokenizer fileinfo)
 
@@ -121,10 +117,10 @@ for ver in "${PHP_VERSIONS[@]}"; do
 done
 
 # 
-──────────────────────────────────────────────────────────────────────────────
+
 # 6) Install phpMyAdmin (no internal DB setup)
 # 
-──────────────────────────────────────────────────────────────────────────────
+
 if is_installed phpmyadmin; then
   echo "→ phpMyAdmin already installed, skipping."
 else
@@ -137,10 +133,10 @@ DEB
 fi
 
 # 
-──────────────────────────────────────────────────────────────────────────────
+
 # 7) Configure Nginx alias for /db (phpMyAdmin)
 # 
-──────────────────────────────────────────────────────────────────────────────
+
 NGINX_DEFAULT="/etc/nginx/sites-available/default"
 if grep -q "location /db/" "$NGINX_DEFAULT"; then
   echo "→ Nginx alias for /db already configured, skipping."
@@ -161,20 +157,20 @@ else
 fi
 
 # 
-──────────────────────────────────────────────────────────────────────────────
+
 # 8) Restart Nginx
 # 
-──────────────────────────────────────────────────────────────────────────────
+
 echo "→ Testing Nginx configuration…"
 sudo nginx -t
 echo "→ Restarting Nginx…"
 sudo systemctl restart nginx
 
 # 
-──────────────────────────────────────────────────────────────────────────────
+
 # 9) Final summary
 # 
-──────────────────────────────────────────────────────────────────────────────
+
 IP_ADDR=$(hostname -I | awk '{print $1}')
 
 cat <<EOF
