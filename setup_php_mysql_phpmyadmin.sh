@@ -1,200 +1,148 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# 
-# Utility functions
-# 
-wait_for_apt() {
-  local lock="/var/lib/dpkg/lock-frontend"
-  local timeout=300  # seconds
-  local waited=0
-  while sudo fuser "$lock" >/dev/null 2>&1; do
-    echo "→ Waiting for apt lock to be released..."
-    sleep 3
-    waited=$((waited + 3))
-    if [ "$waited" -ge "$timeout" ]; then
-      echo "⛔ Timeout waiting for apt lock. Exiting." >&2
-      exit 1
-    fi
+# ──────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ──────────────────────────────────────────────────────────────────────────────
+_wait_for_apt() {
+  local lock=/var/lib/dpkg/lock-frontend max=300 waited=0
+  while sudo fuser "$lock" &>/dev/null 2>&1; do
+    echo "→ Waiting for apt lock..."
+    sleep 3; waited=$((waited+3))
+    [ "$waited" -ge "$max" ] && { echo "⛔ apt lock timeout" >&2; exit 1; }
   done
 }
 
-is_installed() {
-  dpkg -s "$1" &>/dev/null
-}
+_installed() { dpkg -s "$1" &>/dev/null; }
 
-install_pkg() {
-  pkg="$1"
-  if is_installed "$pkg"; then
-    echo "→ Skipping ${pkg}, already installed."
+_install() {
+  local pkg="$1"
+  if _installed "$pkg"; then
+    echo "→ Skipping $pkg"
   else
-    wait_for_apt
-    echo "→ Installing ${pkg}…"
-    sudo apt install -y "$pkg"
+    _wait_for_apt
+    echo "→ Installing $pkg"
+    sudo apt install -y --no-install-recommends "$pkg"
   fi
 }
 
-add_php_ppa() {
-  if grep -Rqs "^deb .\+ondrej/php" /etc/apt/sources.list.d; then
-    echo "→ PHP PPA already present, skipping."
+_add_php_ppa() {
+  if grep -Rq '^deb .\+ondrej/php' /etc/apt/sources.list.d; then
+    echo "→ PHP PPA exists"
   else
-    wait_for_apt
-    echo "→ Adding Ondřej Surý’s PHP PPA…"
+    _wait_for_apt
+    echo "→ Adding Ondřej Surý’s PHP PPA"
     sudo add-apt-repository ppa:ondrej/php -y
-    wait_for_apt
-    sudo apt update
+    _wait_for_apt; sudo apt update
   fi
 }
 
-reinstall_mysql() {
-  wait_for_apt
-  echo "→ Reinstalling MySQL Server…"
-  sudo apt remove -y --purge mysql-server mysql-client mysql-common
-  wait_for_apt
-  sudo apt autoremove -y
-  wait_for_apt
-  sudo apt install -y mysql-server
-}
+# ──────────────────────────────────────────────────────────────────────────────
+# 1) Purge Apache if present
+# ──────────────────────────────────────────────────────────────────────────────
+echo "→ Removing Apache if present"
+if dpkg -l | grep -E 'apache2|libapache2-mod-' &>/dev/null; then
+  sudo apt purge --auto-remove -y apache2* libapache2-mod-*
+fi
 
-# 
-# 1) Update & prerequisites
-# 
-wait_for_apt
-echo "→ Updating apt…"
-sudo apt update
-echo "→ Upgrading packages…"
-wait_for_apt
-sudo apt upgrade -y
-
-PREREQS=(software-properties-common lsb-release ca-certificates apt-transport-https openssl)
-for pkg in "${PREREQS[@]}"; do
-  install_pkg "$pkg"
+# ──────────────────────────────────────────────────────────────────────────────
+# 2) Update & prerequisites
+# ──────────────────────────────────────────────────────────────────────────────
+_wait_for_apt; echo "→ apt update"; sudo apt update
+echo "→ apt upgrade"; _wait_for_apt; sudo apt upgrade -y
+for pkg in software-properties-common lsb-release ca-certificates apt-transport-https openssl wget tar; do
+  _install "$pkg"
 done
 
-# 
-# 2) Add PHP PPA
-# 
-add_php_ppa
-
-# 
-# 3) Install Nginx
-# 
-install_pkg nginx
+# ──────────────────────────────────────────────────────────────────────────────
+# 3) PHP PPA & Nginx
+# ──────────────────────────────────────────────────────────────────────────────
+_add_php_ppa
+_install nginx
 sudo systemctl enable --now nginx
 
-# 
-# 4) Install & configure MySQL root
-# 
-if is_installed mysql-server; then
-  echo "→ MySQL already installed, skipping install."
-else
-  install_pkg mysql-server
-fi
-
-# generate a strong random password (32 hex chars)
+# ──────────────────────────────────────────────────────────────────────────────
+# 4) MySQL & root password
+# ──────────────────────────────────────────────────────────────────────────────
+_install mysql-server
 MYSQL_ROOT_PASS=$(openssl rand -hex 16)
-
-echo "→ Configuring MySQL root user…"
-if sudo mysql <<EOF
+echo "→ Setting MySQL root password"
+sudo mysql <<SQL
 ALTER USER 'root'@'localhost'
   IDENTIFIED WITH mysql_native_password BY '${MYSQL_ROOT_PASS}';
 FLUSH PRIVILEGES;
-EOF
-then
-  echo "→ MySQL root password set."
-else
-  echo "⚠️  Failed to set MySQL root password. Reinstalling MySQL and retrying…"
-  reinstall_mysql
-  MYSQL_ROOT_PASS=$(openssl rand -hex 16)
-  sudo mysql <<EOF
-ALTER USER 'root'@'localhost'
-  IDENTIFIED WITH mysql_native_password BY '${MYSQL_ROOT_PASS}';
-FLUSH PRIVILEGES;
-EOF
-  echo "→ MySQL root password set after reinstall."
-fi
+SQL
+echo "→ Starting MySQL"
+sudo systemctl start mysql
 
-# 
-# 5) Install PHP 8.1–8.4 & Laravel extensions
-# 
+# ──────────────────────────────────────────────────────────────────────────────
+# 5) PHP 8.1–8.4 & Laravel extensions
+# ──────────────────────────────────────────────────────────────────────────────
 PHP_VERSIONS=(8.1 8.2 8.3 8.4)
-EXTS=(fpm cli mysql mbstring curl xml zip gd opcache bcmath intl tokenizer fileinfo)
+EXTS=(fpm cli mysql mbstring curl xml zip gd opcache bcmath intl)
 
 for ver in "${PHP_VERSIONS[@]}"; do
-  echo "→ Processing PHP ${ver}…"
-  install_pkg "php${ver}"
+  echo "→ Installing PHP ${ver} and extensions"
+  _install php"${ver}"-fpm
+  _install php"${ver}"-cli
   for ext in "${EXTS[@]}"; do
-    install_pkg "php${ver}-${ext}"
+    _install php"${ver}"-"${ext}"
   done
-  sudo systemctl enable --now "php${ver}-fpm"
+  sudo systemctl enable --now php"${ver}"-fpm
 done
 
-# 
-# 6) Install phpMyAdmin (no internal DB setup)
-# 
-if is_installed phpmyadmin; then
-  echo "→ phpMyAdmin already installed, skipping."
-else
-  wait_for_apt
-  echo "→ Installing phpMyAdmin…"
-  sudo debconf-set-selections <<DEB
-phpmyadmin phpmyadmin/dbconfig-install boolean false
-DEB
-  export DEBIAN_FRONTEND=noninteractive
-  sudo apt install -y phpmyadmin
-fi
+# ──────────────────────────────────────────────────────────────────────────────
+# 6) Install phpMyAdmin via APT
+# ──────────────────────────────────────────────────────────────────────────────
+echo "→ Installing phpMyAdmin + PHP extensions"
+export DEBIAN_FRONTEND=noninteractive
+sudo apt update
+sudo apt install -y phpmyadmin php-mbstring php-zip php-gd
 
-# 
-# 7) Configure Nginx alias for /db (phpMyAdmin)
-# 
-NGINX_DEFAULT="/etc/nginx/sites-available/default"
-if grep -q "location /db/" "$NGINX_DEFAULT"; then
-  echo "→ Nginx alias for /db already configured, skipping."
-else
-  echo "→ Adding Nginx alias for /db…"
-  sudo sed -i '/server_name _;/a \
-    # phpMyAdmin alias\n\
-    location /db/ {\n\
-        alias /usr/share/phpmyadmin/;\n\
-        index index.php index.html;\n\
-    }\n\
-    location ~ ^/db/(.+\.php)$ {\n\
-        alias /usr/share/phpmyadmin/$1;\n\
-        include fastcgi_params;\n\
-        fastcgi_param SCRIPT_FILENAME /usr/share/phpmyadmin/$1;\n\
-        fastcgi_pass unix:/run/php/php8.1-fpm.sock;\n\
-    }\n' "$NGINX_DEFAULT"
-fi
+# ──────────────────────────────────────────────────────────────────────────────
+# 7) Nginx config for phpMyAdmin
+# ──────────────────────────────────────────────────────────────────────────────
+NGINX_CONF=/etc/nginx/sites-available/default
+echo "→ Adding phpMyAdmin location block to $NGINX_CONF"
+sudo tee -a "$NGINX_CONF" > /dev/null <<'EOF'
 
-# 
-# 8) Restart Nginx
-# 
-echo "→ Testing Nginx configuration…"
+    # phpMyAdmin
+    location /phpmyadmin {
+        alias /usr/share/phpmyadmin/;
+        index index.php index.html;
+    }
+
+    location ~ ^/phpmyadmin/(.+\.php)$ {
+        alias /usr/share/phpmyadmin/$1;
+        fastcgi_pass unix:/run/php/php8.4-fpm.sock;
+        fastcgi_index index.php;
+        include fastcgi_params;
+        fastcgi_param SCRIPT_FILENAME /usr/share/phpmyadmin/$1;
+    }
+
+    location ~* ^/phpmyadmin/(.+\.(css|js|png|jpg|jpeg|gif|ico))$ {
+        alias /usr/share/phpmyadmin/$1;
+    }
+EOF
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 8) Test & reload Nginx + final summary
+# ──────────────────────────────────────────────────────────────────────────────
+echo "→ Testing Nginx configuration"
 sudo nginx -t
-echo "→ Restarting Nginx…"
-sudo systemctl restart nginx
 
-# 
-# 9) Final summary
-# 
-IP_ADDR=$(hostname -I | awk '{print $1}')
+echo "→ Reloading Nginx"
+sudo systemctl reload nginx
 
+IP=$(hostname -I | awk '{print $1}')
 cat <<EOF
 
-✅ Setup complete!
+✅ Setup Complete!
 
-🔗 phpMyAdmin is available at:
-    http://${IP_ADDR}/db
+• phpMyAdmin → http://${IP}/phpmyadmin
+• MySQL root   → root / ${MYSQL_ROOT_PASS}
+• PHP versions → ${PHP_VERSIONS[*]}
+• Extensions   → ${EXTS[*]}
 
-👤 MySQL root credentials:
-    username: root
-    password: ${MYSQL_ROOT_PASS}
-
-📦 PHP versions installed:
-    • ${PHP_VERSIONS[*]}
-📦 Extensions installed for each:
-    • ${EXTS[*]}
-
-This script will wait for any existing apt/dpkg processes to finish before proceeding,
-and will retry MySQL installation on failure.
+Your pure LEMP server is ready for Laravel.
 EOF
